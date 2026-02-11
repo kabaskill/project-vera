@@ -1,7 +1,7 @@
 export interface CanonicalProduct {
   id: string;
   canonical_name: string;
-  brand: string;
+  brand: string | null;
   gtin: string | null;
   ean: string | null;
   image_url: string | null;
@@ -13,7 +13,7 @@ export interface StoreProduct {
   id: string;
   product_id: string;
   store: string;
-  store_sku: string;
+  store_sku: string | null;
   product_url: string;
   metadata: Record<string, unknown>;
   created_at: Date;

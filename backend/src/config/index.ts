@@ -6,6 +6,7 @@ const envSchema = z.object({
   DATABASE_URL: z.string(),
   SUPABASE_LOCAL_DB_URL: z.string().optional(),
   API_PREFIX: z.string().default("/api/v1"),
+  REDIS_URL: z.string().default("redis://localhost:6379"),
 });
 
 const parsed = envSchema.safeParse(process.env);

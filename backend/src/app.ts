@@ -8,10 +8,11 @@ import { startAllWorkers } from "./workers/index.ts";
 import { productRoutes } from "./api/routes/products.ts";
 import { userRoutes } from "./api/routes/users.ts";
 import { healthRoutes } from "./api/routes/health.ts";
+import { adminRoutes } from "./api/routes/admin.ts";
 
 export async function buildApp() {
   const app = Fastify({
-    logger: config.NODE_ENV === "development",
+    logger: false,
   });
 
   await app.register(cors, { origin: true, credentials: true });
@@ -30,6 +31,7 @@ export async function buildApp() {
   await app.register(healthRoutes, { prefix: config.API_PREFIX });
   await app.register(productRoutes, { prefix: `${config.API_PREFIX}/products` });
   await app.register(userRoutes, { prefix: `${config.API_PREFIX}/users` });
+  await app.register(adminRoutes, { prefix: `${config.API_PREFIX}/admin` });
 
   app.setErrorHandler((error, request, reply) => {
     app.log.error(error);
