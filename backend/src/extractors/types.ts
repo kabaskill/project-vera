@@ -20,5 +20,5 @@ export interface ExtractionResult {
   url: string;
   store: string;
   product: ExtractedProduct;
-  method: "jsonld" | "opengraph" | "merchant" | "heuristic";
+  method: "jsonld" | "opengraph" | "merchant" | "heuristic" | "universal";
 }

@@ -118,11 +118,27 @@ export class MerchantRegistry {
     return this.getAll().filter(m => m.supportsSearch);
   }
 
-  buildSearchUrl(merchantId: string, query: string): string | null {
+  buildSearchUrl(merchantId: string, query: string, sourceUrl?: string): string | null {
     const merchant = this.getById(merchantId);
     if (!merchant?.searchUrlTemplate) return null;
 
-    return merchant.searchUrlTemplate.replace("{query}", encodeURIComponent(query));
+    let template = merchant.searchUrlTemplate;
+
+    // For Amazon, try to match the domain from the source URL
+    if (merchantId === "amazon" && sourceUrl) {
+      try {
+        const sourceDomain = new URL(sourceUrl).hostname.toLowerCase();
+        // Extract the TLD from the source domain
+        const tldMatch = sourceDomain.match(/amazon\.([a-z.]+)$/);
+        if (tldMatch) {
+          template = `https://www.amazon.${tldMatch[1]}/s?k={query}`;
+        }
+      } catch {
+        // Fallback to default template
+      }
+    }
+
+    return template.replace("{query}", encodeURIComponent(query));
   }
 }
 

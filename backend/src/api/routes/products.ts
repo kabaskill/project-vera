@@ -10,6 +10,12 @@ const submitUrlSchema = z.object({
   userId: z.string().optional(),
 });
 
+const submitHtmlSchema = z.object({
+  url: z.string().url(),
+  html: z.string().min(100, "HTML must be at least 100 characters"),
+  userId: z.string().optional(),
+});
+
 const REDIS_KEY_PREFIX = {
   urlHash: "url_hash:",
   prices: "prices:",
@@ -191,6 +197,82 @@ export async function productRoutes(app: FastifyInstance) {
         name: p.canonical_name,
         brand: p.brand,
       })),
+    };
+  });
+
+  // Submit HTML for processing (admin/testing only)
+  app.post("/submit-html", async (request, reply) => {
+    const body = submitHtmlSchema.parse(request.body);
+    
+    // Queue extraction job with HTML
+    const jobId = await jobQueue.enqueue("extract_product", {
+      url: body.url,
+      html: body.html,
+      userId: body.userId,
+      source: "html_paste",
+    });
+
+    return {
+      job_id: jobId,
+      status: "queued",
+      message: "HTML submitted for processing",
+    };
+  });
+
+  // Test extraction from HTML (admin/testing only)
+  app.post("/test-extraction", async (request, reply) => {
+    const body = z.object({
+      url: z.string().url(),
+      html: z.string(),
+    }).parse(request.body);
+    
+    try {
+      const { universalExtractor } = await import("../../extractors/universal.ts");
+      const result = universalExtractor.extract(body.html, body.url);
+      
+      if (!result) {
+        reply.status(422);
+        return { error: "Failed to extract product from HTML" };
+      }
+      
+      return result;
+    } catch (error) {
+      reply.status(500);
+      return { error: String(error) };
+    }
+  });
+
+  // Submit from extension (pre-extracted data)
+  app.post("/extension", async (request, reply) => {
+    const body = z.object({
+      url: z.string().url(),
+      extractedData: z.object({
+        name: z.string(),
+        price: z.number(),
+        currency: z.string().optional(),
+        brand: z.string().optional(),
+        gtin: z.string().optional(),
+        ean: z.string().optional(),
+        sku: z.string().optional(),
+        imageUrl: z.string().optional(),
+        availability: z.boolean().optional(),
+        description: z.string().optional(),
+      }),
+      userId: z.string().optional(),
+    }).parse(request.body);
+    
+    // Queue job with pre-extracted data
+    const jobId = await jobQueue.enqueue("extract_product", {
+      url: body.url,
+      extractedData: body.extractedData,
+      userId: body.userId,
+      source: "extension",
+    });
+
+    return {
+      job_id: jobId,
+      status: "queued",
+      message: "Product submitted from extension",
     };
   });
 }

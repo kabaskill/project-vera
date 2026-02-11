@@ -15,7 +15,11 @@ interface MerchantMatch {
   merchantId: string;
   searchUrl: string;
   confidence: "exact" | "strong" | "weak";
+  priority: number;
 }
+
+// Maximum number of concurrent price fetches
+const MAX_CONCURRENT_FETCHES = 5;
 
 export async function processResolveMerchantsJob(job: Job): Promise<void> {
   const payload = job.payload as ResolveMerchantsPayload;
@@ -33,29 +37,39 @@ export async function processResolveMerchantsJob(job: Job): Promise<void> {
     for (const merchant of merchants) {
       // Build search query
       const searchQuery = buildSearchQuery(payload);
-      const searchUrl = merchantRegistry.buildSearchUrl(merchant.id, searchQuery);
+      const searchUrl = merchantRegistry.buildSearchUrl(merchant.id, searchQuery, payload.originalUrl);
       
       if (!searchUrl) continue;
 
       // Determine confidence level
       let confidence: "exact" | "strong" | "weak" = "weak";
+      let priority = 0;
       
       if (payload.gtin && merchant.supportsGtin) {
         confidence = "exact";
+        priority = 100;
       } else if (payload.brand && searchQuery.includes(payload.brand)) {
         confidence = "strong";
+        priority = 50;
       }
 
       matches.push({
         merchantId: merchant.id,
         searchUrl,
         confidence,
+        priority,
       });
     }
 
+    // Sort by priority (highest first) and limit to top matches
+    const sortedMatches = matches
+      .sort((a, b) => b.priority - a.priority)
+      .slice(0, MAX_CONCURRENT_FETCHES);
+
     // Queue fetch prices jobs for each match
-    for (const match of matches.slice(0, 5)) { // Limit to top 5 merchants
-      await jobQueue.enqueue("fetch_prices", {
+    // These will be processed in parallel by multiple workers
+    const enqueuePromises = sortedMatches.map(match => 
+      jobQueue.enqueue("fetch_prices", {
         productId: payload.productId,
         merchantId: match.merchantId,
         searchUrl: match.searchUrl,
@@ -63,15 +77,17 @@ export async function processResolveMerchantsJob(job: Job): Promise<void> {
         brand: payload.brand,
         gtin: payload.gtin,
         confidence: match.confidence,
-      });
-    }
+      })
+    );
+
+    await Promise.all(enqueuePromises);
 
     await jobQueue.complete(job.id, { 
-      resolvedMerchants: matches.length,
-      merchants: matches.map(m => m.merchantId),
+      resolvedMerchants: sortedMatches.length,
+      merchants: sortedMatches.map(m => m.merchantId),
     });
 
-    console.log(`[ResolveWorker] Queued ${matches.length} price fetch jobs`);
+    console.log(`[ResolveWorker] Queued ${sortedMatches.length} price fetch jobs in parallel`);
   } catch (error) {
     console.error(`[ResolveWorker] Failed to resolve merchants:`, error);
     
@@ -84,7 +100,7 @@ export async function processResolveMerchantsJob(job: Job): Promise<void> {
 }
 
 function buildSearchQuery(payload: ResolveMerchantsPayload): string {
-  // Prefer GTIN if available
+  // Prefer GTIN if available (most accurate)
   if (payload.gtin) {
     return payload.gtin;
   }

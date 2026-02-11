@@ -79,6 +79,12 @@ export function Sidebar() {
             Submit by URL
           </Button>
         </Link>
+        <Link href="/dashboard/products/html-submit">
+          <Button className="w-full gap-2" variant="outline" size="sm">
+            <Link2 className="h-4 w-4" />
+            Submit by HTML
+          </Button>
+        </Link>
       </div>
     </div>
   );

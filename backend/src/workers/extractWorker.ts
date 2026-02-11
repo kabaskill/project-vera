@@ -3,47 +3,139 @@ import { extractionService } from "../services/extraction.ts";
 import * as productQueries from "../db/queries/products.ts";
 import { getRedisClient } from "../services/redis.ts";
 import type { ExtractedProduct } from "../extractors/types.ts";
+import { cleanGtin } from "../utils/gtinValidator.ts";
 
 interface ExtractProductPayload {
   url: string;
   userId?: string;
+  html?: string; // Optional: for HTML paste mode
+  source?: 'url_fetch' | 'html_paste' | 'extension';
+  extractedData?: ExtractedProduct; // Optional: for extension mode
 }
 
 const REDIS_KEY_PREFIX = {
   urlHash: "url_hash:",
   productIdentity: "product_identity:",
+  extractionResult: "extraction:",
   prices: "prices:",
 };
 
+const CACHE_TTL = {
+  extractionResult: 86400 * 7, // 7 days
+  urlProcessed: 86400, // 24 hours
+  productIdentity: 86400 * 30, // 30 days
+};
+
 export async function processExtractProductJob(job: Job): Promise<void> {
-  const { url, userId } = job.payload as ExtractProductPayload;
+  const { url, userId, html, source = 'url_fetch', extractedData } = job.payload as ExtractProductPayload;
   
-  console.log(`[ExtractWorker] Processing URL: ${url}`);
+  console.log(`[ExtractWorker] Processing ${source}: ${url}`);
 
   try {
-    // Check URL cache in Redis
     const urlHash = await hashUrl(url);
     const redis = getRedisClient();
-    const cachedStatus = await redis.get(`${REDIS_KEY_PREFIX.urlHash}${urlHash}`);
     
-    if (cachedStatus === "done") {
-      console.log(`[ExtractWorker] URL already processed: ${url}`);
-      await jobQueue.complete(job.id, { cached: true });
-      return;
+    // Check cache for URL fetch mode
+    if (source === 'url_fetch') {
+      const cachedStatus = await redis.get(`${REDIS_KEY_PREFIX.urlHash}${urlHash}`);
+      
+      if (cachedStatus === "done") {
+        console.log(`[ExtractWorker] URL already processed: ${url}`);
+        
+        const cachedProductId = await redis.get(`${REDIS_KEY_PREFIX.extractionResult}${urlHash}`);
+        if (cachedProductId) {
+          await jobQueue.complete(job.id, { 
+            cached: true,
+            productId: cachedProductId,
+          });
+          return;
+        }
+      }
+
+      // Check for cached extraction result
+      const cachedExtraction = await redis.get(`${REDIS_KEY_PREFIX.extractionResult}${urlHash}`);
+      if (cachedExtraction) {
+        console.log(`[ExtractWorker] Using cached extraction for: ${url}`);
+        const cachedData = JSON.parse(cachedExtraction);
+        
+        await finalizeExtraction(cachedData.productId, url, userId, job.id);
+        return;
+      }
     }
 
     // Set processing status
     await redis.setex(`${REDIS_KEY_PREFIX.urlHash}${urlHash}`, 3600, "processing");
 
-    // Extract product
-    const result = await extractionService.extractFromUrl(url);
-    
-    if (!result) {
-      throw new Error("Failed to extract product data");
+    // Extract product based on source
+    let product: ExtractedProduct | null = null;
+    let store = "unknown";
+    let method = source;
+
+    if (source === 'extension' && extractedData) {
+      // Trust client data from extension
+      console.log(`[ExtractWorker] Using extension data for: ${url}`);
+      product = extractedData;
+      store = detectStoreFromUrl(url);
+      
+      // Validate the data
+      if (!isValidProduct(product)) {
+        throw new Error("Invalid product data from extension");
+      }
+    } else if (source === 'html_paste' && html) {
+      // Extract from provided HTML
+      console.log(`[ExtractWorker] Extracting from pasted HTML: ${url}`);
+      const result = extractionService.extractFromHtml(url, html);
+      
+      if (!result) {
+        throw new Error("Failed to extract product from HTML");
+      }
+      
+      product = result.product;
+      store = result.store;
+    } else {
+      // Fetch and extract from URL
+      console.log(`[ExtractWorker] Fetching and extracting from URL: ${url}`);
+      
+      const extractionPromise = extractionService.extractFromUrl(url);
+      const timeoutPromise = new Promise<null>((_, reject) => 
+        setTimeout(() => reject(new Error("Extraction timeout")), 15000)
+      );
+      
+      const result = await Promise.race([extractionPromise, timeoutPromise]);
+      
+      if (!result) {
+        throw new Error("Failed to extract product data from URL");
+      }
+      
+      product = result.product;
+      store = result.store;
+    }
+
+    // Clean and validate GTIN/EAN
+    if (product.gtin) {
+      product.gtin = cleanGtin(product.gtin);
+    }
+    if (product.ean) {
+      product.ean = cleanGtin(product.ean);
     }
 
     // Find or create canonical product
-    let canonicalProduct = await findOrCreateCanonicalProduct(result.product, url, result.store);
+    let canonicalProduct = await findOrCreateCanonicalProduct(product, url, store);
+    
+    // Cache the extraction result (only for URL fetch mode)
+    if (source === 'url_fetch') {
+      await redis.setex(
+        `${REDIS_KEY_PREFIX.extractionResult}${urlHash}`,
+        CACHE_TTL.extractionResult,
+        JSON.stringify({
+          productId: canonicalProduct.id,
+          product,
+          store,
+          method,
+          timestamp: new Date().toISOString(),
+        })
+      );
+    }
     
     // Check if store product already exists for this URL
     const existingStoreProduct = await productQueries.getStoreProductByUrl(url);
@@ -51,27 +143,31 @@ export async function processExtractProductJob(job: Job): Promise<void> {
     let storeProductId: string;
     
     if (existingStoreProduct) {
-      // Use existing store product
       storeProductId = existingStoreProduct.id;
+      console.log(`[ExtractWorker] Using existing store product: ${storeProductId}`);
     } else {
       // Create new store product
       const newStoreProduct = await productQueries.createStoreProduct({
         product_id: canonicalProduct.id,
-        store: result.store,
-        store_sku: result.product.sku,
+        store,
+        store_sku: product.sku,
         product_url: url,
-        metadata: { extraction_method: result.method },
+        metadata: { 
+          extraction_method: method,
+          source,
+          extracted_at: new Date().toISOString(),
+        },
       });
       storeProductId = newStoreProduct.id;
     }
 
-    // Create price entry (even if store product exists, we want to track price history)
-    if (result.product.price !== null) {
+    // Create price entry
+    if (product.price !== null && product.price > 0) {
       await productQueries.createPrice({
         store_product_id: storeProductId,
-        price: result.product.price,
-        currency: result.product.currency || "BRL",
-        availability: result.product.availability ?? true,
+        price: product.price,
+        currency: product.currency || getDefaultCurrency(store),
+        availability: product.availability ?? true,
       });
     }
 
@@ -81,12 +177,14 @@ export async function processExtractProductJob(job: Job): Promise<void> {
     // Cache product identity in Redis
     await redis.setex(
       `${REDIS_KEY_PREFIX.productIdentity}${canonicalProduct.id}`,
-      86400 * 30, // 30 days
+      CACHE_TTL.productIdentity,
       JSON.stringify(canonicalProduct)
     );
 
-    // Mark URL as done
-    await redis.setex(`${REDIS_KEY_PREFIX.urlHash}${urlHash}`, 86400, "done");
+    // Mark URL as done (only for URL fetch mode)
+    if (source === 'url_fetch') {
+      await redis.setex(`${REDIS_KEY_PREFIX.urlHash}${urlHash}`, CACHE_TTL.urlProcessed, "done");
+    }
 
     // Queue merchant resolution job
     await jobQueue.enqueue("resolve_merchants", {
@@ -95,22 +193,28 @@ export async function processExtractProductJob(job: Job): Promise<void> {
       brand: canonicalProduct.brand,
       gtin: canonicalProduct.gtin,
       ean: canonicalProduct.ean,
-      originalStore: result.store,
+      originalStore: store,
       originalUrl: url,
     });
 
     // Add to user history if userId provided
     if (userId) {
-      const { addProductToUserHistory } = await import("../db/queries/users.ts");
-      await addProductToUserHistory(userId, canonicalProduct.id);
+      try {
+        const { addProductToUserHistory } = await import("../db/queries/users.ts");
+        await addProductToUserHistory(userId, canonicalProduct.id);
+      } catch (error) {
+        console.warn(`[ExtractWorker] Failed to add to user history:`, error);
+      }
     }
 
     await jobQueue.complete(job.id, { 
       productId: canonicalProduct.id,
       storeProductId: storeProductId,
+      cached: false,
+      source,
     });
 
-    console.log(`[ExtractWorker] Completed: ${canonicalProduct.id}`);
+    console.log(`[ExtractWorker] Completed: ${canonicalProduct.id} (${method})`);
   } catch (error) {
     console.error(`[ExtractWorker] Failed to process ${url}:`, error);
     
@@ -126,54 +230,73 @@ export async function processExtractProductJob(job: Job): Promise<void> {
   }
 }
 
+async function finalizeExtraction(
+  productId: string,
+  url: string,
+  userId: string | undefined,
+  jobId: string
+): Promise<void> {
+  // Add to user history if userId provided
+  if (userId) {
+    try {
+      const { addProductToUserHistory } = await import("../db/queries/users.ts");
+      await addProductToUserHistory(userId, productId);
+    } catch (error) {
+      console.warn(`[ExtractWorker] Failed to add to user history:`, error);
+    }
+  }
+
+  await jobQueue.complete(jobId, { 
+    productId,
+    cached: true,
+  });
+}
+
 async function findOrCreateCanonicalProduct(
   extracted: ExtractedProduct,
   url: string,
   storeName?: string
 ): Promise<{ id: string; canonical_name: string; brand: string | null; gtin: string | null; ean: string | null; image_url: string | null; created_at: Date; updated_at: Date }> {
-  // Try to find by GTIN
+  // Try to find by GTIN (most reliable)
   if (extracted.gtin) {
     const byGtin = await productQueries.findProductByGtin(extracted.gtin);
-    if (byGtin) return byGtin;
+    if (byGtin) {
+      console.log(`[ExtractWorker] Found existing product by GTIN: ${byGtin.id}`);
+      return byGtin;
+    }
   }
 
   // Try to find by EAN
   if (extracted.ean) {
     const byEan = await productQueries.findProductByEan(extracted.ean);
-    if (byEan) return byEan;
+    if (byEan) {
+      console.log(`[ExtractWorker] Found existing product by EAN: ${byEan.id}`);
+      return byEan;
+    }
   }
 
   // Try to find by SKU + store
-  // Use the provided store name or extract from URL
-  let store = storeName;
-  if (!store) {
-    try {
-      const domain = new URL(url).hostname.toLowerCase();
-      if (domain.includes("zalando")) store = "zalando";
-      else if (domain.includes("amazon")) store = "amazon";
-      else if (domain.includes("mercadolivre") || domain.includes("mercadolibre")) store = "mercadolivre";
-      else if (domain.includes("magazineluiza")) store = "magazineluiza";
-      else if (domain.includes("casasbahia")) store = "casasbahia";
-      else if (domain.includes("americanas")) store = "americanas";
-      else if (domain.includes("submarino")) store = "submarino";
-      else store = "unknown";
-    } catch {
-      store = "unknown";
-    }
-  }
+  const store = storeName || detectStoreFromUrl(url);
   
-  if (extracted.sku) {
+  if (extracted.sku && store) {
     const bySku = await productQueries.findProductByStoreSku(store, extracted.sku);
-    if (bySku) return bySku;
+    if (bySku) {
+      console.log(`[ExtractWorker] Found existing product by SKU: ${bySku.id}`);
+      return bySku;
+    }
   }
 
   // Try to find by name + brand
   if (extracted.name && extracted.brand) {
     const byNameBrand = await productQueries.findProductByNameAndBrand(extracted.name, extracted.brand);
-    if (byNameBrand) return byNameBrand;
+    if (byNameBrand) {
+      console.log(`[ExtractWorker] Found existing product by name+brand: ${byNameBrand.id}`);
+      return byNameBrand;
+    }
   }
 
   // Create new canonical product
+  console.log(`[ExtractWorker] Creating new canonical product: ${extracted.name}`);
   return await productQueries.createCanonicalProduct({
     canonical_name: extracted.name,
     brand: extracted.brand,
@@ -181,6 +304,39 @@ async function findOrCreateCanonicalProduct(
     ean: extracted.ean,
     image_url: extracted.imageUrl,
   });
+}
+
+function detectStoreFromUrl(url: string): string {
+  try {
+    const domain = new URL(url).hostname.toLowerCase();
+    if (domain.includes("zalando")) return "zalando";
+    if (domain.includes("amazon")) return "amazon";
+    if (domain.includes("mercadolivre") || domain.includes("mercadolibre")) return "mercadolivre";
+    if (domain.includes("magazineluiza")) return "magazineluiza";
+    if (domain.includes("casasbahia")) return "casasbahia";
+    if (domain.includes("americanas")) return "americanas";
+    if (domain.includes("submarino")) return "submarino";
+    return "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+function isValidProduct(product: ExtractedProduct): boolean {
+  return !!(product.name && product.name.length >= 3);
+}
+
+function getDefaultCurrency(store: string): string {
+  const currencies: Record<string, string> = {
+    mercadolivre: "BRL",
+    amazon: "BRL",
+    zalando: "EUR",
+    magazineluiza: "BRL",
+    casasbahia: "BRL",
+    americanas: "BRL",
+    submarino: "BRL",
+  };
+  return currencies[store] || "BRL";
 }
 
 async function hashUrl(url: string): Promise<string> {

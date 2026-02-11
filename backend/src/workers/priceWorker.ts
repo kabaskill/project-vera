@@ -3,6 +3,7 @@ import { extractionService } from "../services/extraction.ts";
 import { merchantRegistry } from "../merchants/registry.ts";
 import * as productQueries from "../db/queries/products.ts";
 import { getRedisClient } from "../services/redis.ts";
+import { fetchWithRetry } from "../utils/httpHelpers.ts";
 import type { ExtractedProduct } from "../extractors/types.ts";
 
 interface FetchPricesPayload {
@@ -19,15 +20,15 @@ const REDIS_KEY_PREFIX = {
   prices: "prices:",
 };
 
+const HTTP_TIMEOUT = 10000; // 10 seconds
+
 export async function processFetchPricesJob(job: Job): Promise<void> {
   const payload = job.payload as FetchPricesPayload;
   
   console.log(`[FetchWorker] Fetching prices from ${payload.merchantId}`);
 
   try {
-    // For Phase 1, we'll do a simplified search
-    // In a full implementation, this would parse search results
-    const searchResult = await searchMerchant(payload);
+    const searchResult = await searchAndExtractProduct(payload);
     
     if (!searchResult) {
       console.log(`[FetchWorker] No matching product found on ${payload.merchantId}`);
@@ -61,12 +62,12 @@ export async function processFetchPricesJob(job: Job): Promise<void> {
     }
 
     // Create price entry
-    if (searchResult.price !== null) {
+    if (searchResult.price > 0) {
       await productQueries.createPrice({
         store_product_id: storeProductId,
         price: searchResult.price,
-        currency: searchResult.currency || "BRL",
-        availability: searchResult.availability ?? true,
+        currency: searchResult.currency || getDefaultCurrency(payload.merchantId),
+        availability: true,
       });
     }
 
@@ -97,92 +98,179 @@ export async function processFetchPricesJob(job: Job): Promise<void> {
   }
 }
 
-async function searchMerchant(payload: FetchPricesPayload): Promise<{
+interface SearchResult {
   url: string;
-  price: number | null;
+  price: number;
   currency: string | null;
-  availability: boolean | null;
   sku: string | null;
-} | null> {
-  // For Phase 1, we implement a simplified version
-  // Try to fetch the search URL and look for matching products
-  
+}
+
+/**
+ * Search for product and extract from result pages
+ */
+async function searchAndExtractProduct(payload: FetchPricesPayload): Promise<SearchResult | null> {
   try {
-    const response = await fetch(payload.searchUrl, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      },
-    });
+    console.log(`[FetchWorker] Searching: ${payload.searchUrl}`);
+    
+    // Fetch search results with timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), HTTP_TIMEOUT);
+
+    const response = await fetchWithRetry(payload.searchUrl, {
+      signal: controller.signal,
+    }, 1);
+
+    clearTimeout(timeoutId);
 
     if (!response.ok) {
+      console.warn(`[FetchWorker] Search returned ${response.status} for ${payload.merchantId}`);
       return null;
     }
 
     const html = await response.text();
     
-    // Try to extract products from search results
-    // This is simplified - real implementation would parse search result structure
-    const extracted = extractionService.extractFromHtml(payload.searchUrl, html);
+    // Extract product URLs from search results
+    const productUrls = extractProductUrls(html, payload.merchantId, payload.searchUrl);
+    console.log(`[FetchWorker] Found ${productUrls.length} product URLs on ${payload.merchantId}`);
     
-    if (!extracted) {
+    if (productUrls.length === 0) {
       return null;
     }
 
-    // Check if this is likely the same product
-    if (!isLikelySameProduct(extracted.product, payload)) {
-      return null;
+    // Try to extract from each product page (limit to first 3)
+    for (const productUrl of productUrls.slice(0, 3)) {
+      try {
+        console.log(`[FetchWorker] Trying product: ${productUrl}`);
+        
+        const extracted = await extractionService.extractFromUrl(productUrl);
+        
+        if (!extracted) {
+          continue;
+        }
+
+        // Check if this is likely the same product
+        const matchScore = calculateMatchScore(extracted.product, payload);
+        console.log(`[FetchWorker] Match score for ${productUrl}: ${matchScore.score}`);
+        
+        if (matchScore.score >= 60) {
+          return {
+            url: productUrl,
+            price: extracted.product.price || 0,
+            currency: extracted.product.currency,
+            sku: extracted.product.sku,
+          };
+        }
+      } catch (error) {
+        console.warn(`[FetchWorker] Failed to extract from ${productUrl}:`, error);
+        continue;
+      }
     }
 
-    return {
-      url: extracted.url,
-      price: extracted.product.price,
-      currency: extracted.product.currency,
-      availability: extracted.product.availability,
-      sku: extracted.product.sku,
-    };
+    return null;
   } catch (error) {
-    console.error(`[FetchWorker] Search failed for ${payload.merchantId}:`, error);
+    if (error instanceof Error && error.name === "AbortError") {
+      console.error(`[FetchWorker] Request timeout for ${payload.merchantId}`);
+    } else {
+      console.error(`[FetchWorker] Search failed for ${payload.merchantId}:`, error);
+    }
     return null;
   }
 }
 
-function isLikelySameProduct(
-  extracted: ExtractedProduct, 
-  payload: FetchPricesPayload
-): boolean {
-  // Exact match by GTIN
-  if (payload.gtin && extracted.gtin === payload.gtin) {
-    return true;
+/**
+ * Extract product URLs from search result HTML
+ */
+function extractProductUrls(html: string, merchantId: string, baseUrl: string): string[] {
+  const urls: string[] = [];
+  const seen = new Set<string>();
+
+  // Pattern for product links based on merchant
+  const patterns: Record<string, RegExp> = {
+    mercadolivre: /<a[^>]*href=["'](https:\/\/[^"']*mercadolivre\.com\.br\/[^"']+)["'][^>]*>/gi,
+    amazon: /<a[^>]*href=["'](https:\/\/[^"']*amazon\.[^"\/]+\/dp\/[^"']+|\/dp\/[^"']+)["'][^>]*>/gi,
+    zalando: /<a[^>]*href=["'](https:\/\/[^"']*zalando\.[^"\/]+\/[^"']+\.html)["'][^>]*>/gi,
+    magazineluiza: /<a[^>]*href=["'](https:\/\/[^"']*magazineluiza\.com\.br\/[^"']+)["'][^>]*>/gi,
+    casasbahia: /<a[^>]*href=["'](https:\/\/[^"']*casasbahia\.com\.br\/[^"']+)["'][^>]*>/gi,
+    americanas: /<a[^>]*href=["'](https:\/\/[^"']*americanas\.com\.br\/[^"']+)["'][^>]*>/gi,
+    submarino: /<a[^>]*href=["'](https:\/\/[^"']*submarino\.com\.br\/[^"']+)["'][^>]*>/gi,
+  };
+
+  const pattern = patterns[merchantId];
+  if (!pattern) return [];
+
+  const matches = [...html.matchAll(pattern)];
+  
+  for (const match of matches) {
+    let url = match[1];
+    if (!url) continue;
+
+    // Normalize URL
+    if (url.startsWith("/")) {
+      const base = new URL(baseUrl);
+      url = `${base.protocol}//${base.host}${url}`;
+    }
+
+    // Skip duplicate links
+    if (!seen.has(url)) {
+      seen.add(url);
+      urls.push(url);
+    }
   }
 
-  // Check name similarity
+  return urls.slice(0, 10);
+}
+
+interface MatchScore {
+  score: number;
+  reasons: string[];
+}
+
+/**
+ * Calculate how well an extracted product matches our target
+ */
+function calculateMatchScore(extracted: ExtractedProduct, payload: FetchPricesPayload): MatchScore {
+  let score = 0;
+  const reasons: string[] = [];
+
+  // Exact GTIN match (highest priority)
+  if (payload.gtin && extracted.gtin === payload.gtin) {
+    score += 100;
+    reasons.push("exact_gtin_match");
+    return { score, reasons };
+  }
+
+  // Name similarity
   const nameSimilarity = calculateSimilarity(
     extracted.name.toLowerCase(),
     payload.productName.toLowerCase()
   );
-
-  // Brand match improves confidence
-  const brandMatch = payload.brand && extracted.brand 
-    ? extracted.brand.toLowerCase() === payload.brand.toLowerCase()
-    : false;
-
-  // For exact confidence, require high similarity
-  if (payload.confidence === "exact") {
-    return nameSimilarity > 0.9;
+  score += nameSimilarity * 50;
+  
+  if (nameSimilarity > 0.8) {
+    reasons.push("high_name_similarity");
+  } else if (nameSimilarity > 0.5) {
+    reasons.push("moderate_name_similarity");
   }
 
-  // For strong confidence, require good similarity and brand match
-  if (payload.confidence === "strong") {
-    return nameSimilarity > 0.7 && brandMatch;
+  // Brand match
+  if (payload.brand && extracted.brand) {
+    const brandMatch = extracted.brand.toLowerCase() === payload.brand.toLowerCase();
+    if (brandMatch) {
+      score += 30;
+      reasons.push("brand_match");
+    }
   }
 
-  // For weak confidence, accept moderate similarity
-  return nameSimilarity > 0.6;
+  // Price sanity check
+  if (extracted.price && extracted.price > 0) {
+    score += 10;
+    reasons.push("has_price");
+  }
+
+  return { score, reasons };
 }
 
 function calculateSimilarity(str1: string, str2: string): number {
-  // Simple Levenshtein-based similarity
   const longer = str1.length > str2.length ? str1 : str2;
   const shorter = str1.length > str2.length ? str2 : str1;
   
@@ -224,7 +312,6 @@ async function findExistingStoreProduct(
   productId: string, 
   store: string
 ): Promise<string | null> {
-  // Query to check if store product exists
   const { sql } = await import("../db/connection.ts");
   const result = await sql`
     SELECT id FROM store_products 
@@ -233,4 +320,18 @@ async function findExistingStoreProduct(
   `;
   
   return result[0]?.id as string | null;
+}
+
+function getDefaultCurrency(merchantId: string): string {
+  const currencies: Record<string, string> = {
+    mercadolivre: "BRL",
+    amazon: "BRL",
+    zalando: "EUR",
+    magazineluiza: "BRL",
+    casasbahia: "BRL",
+    americanas: "BRL",
+    submarino: "BRL",
+  };
+
+  return currencies[merchantId] || "BRL";
 }
