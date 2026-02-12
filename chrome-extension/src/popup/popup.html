@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Product Tracker</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <div class="container">
+      <header class="header">
+        <div class="header-content">
+          <h1>Product Tracker</h1>
+          <p class="subtitle">Extract and track product prices</p>
+        </div>
+        <button id="btn-expand" class="btn-expand" title="Open in new window">⤢</button>
+      </header>
+
+      <main class="main">
+        <!-- Loading State -->
+        <div id="loading" class="state hidden">
+          <div class="spinner"></div>
+          <p>Analyzing page...</p>
+        </div>
+
+        <!-- Product Found State -->
+        <div id="product-found" class="state hidden">
+          <div class="product-card">
+            <div class="product-image">
+              <img id="product-img" src="" alt="Product" />
+            </div>
+            <div class="product-info">
+              <h2 id="product-name" class="product-name"></h2>
+              <p id="product-brand" class="product-brand"></p>
+              <div class="price-container">
+                <span id="product-price" class="price"></span>
+                <span id="product-currency" class="currency"></span>
+              </div>
+              <div class="meta-info">
+                <span id="product-sku" class="meta-item"></span>
+                <span id="product-gtin" class="meta-item"></span>
+              </div>
+            </div>
+          </div>
+          <button id="btn-track" class="btn btn-primary">Track This Product</button>
+        </div>
+
+        <!-- No Product State -->
+        <div id="no-product" class="state hidden">
+          <div class="icon">🔍</div>
+          <h2>No Product Found</h2>
+          <p>We couldn't detect any product data on this page.</p>
+          <p class="hint">Try navigating to a product page on an e-commerce website.</p>
+          <button id="btn-refresh" class="btn btn-secondary">Refresh</button>
+        </div>
+
+        <!-- Success State -->
+        <div id="success" class="state hidden">
+          <div class="icon success-icon">✓</div>
+          <h2>Product Tracked!</h2>
+          <p>We've saved this product and will monitor its price.</p>
+          <div class="success-actions">
+            <button id="btn-view" class="btn btn-secondary">View Product</button>
+            <button id="btn-track-another" class="btn btn-primary">Track Another</button>
+          </div>
+        </div>
+
+        <!-- Error State -->
+        <div id="error" class="state hidden">
+          <div class="icon error-icon">✗</div>
+          <h2>Something Went Wrong</h2>
+          <p id="error-message"></p>
+          <button id="btn-retry" class="btn btn-primary">Try Again</button>
+        </div>
+
+        <!-- Initial State -->
+        <div id="initial" class="state">
+          <button id="btn-extract" class="btn btn-primary btn-large">
+            <span class="btn-icon">🔍</span>
+            Extract Product
+          </button>
+          <p class="hint">Click to analyze the current page</p>
+        </div>
+      </main>
+    </div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
