@@ -55,13 +55,15 @@ export class UniversalExtractor {
       name: this.cleanText(result.name) || "",
       brand: result.brand ? this.cleanText(result.brand) : null,
       price: result.price,
-      currency: result.currency || this.detectCurrency(result.price),
+      currency: result.currency || this.detectCurrency(result.price ?? 0),
       gtin: cleanGtin(result.gtin) || cleanGtin(result.ean) || null,
       ean: cleanGtin(result.ean) || null,
       sku: result.sku ? this.cleanText(result.sku) : null,
       imageUrl: result.imageUrl || null,
       availability: result.availability ?? true,
       description: result.description ? this.cleanText(result.description) : null,
+      category: result.category ? this.cleanText(result.category) : null,
+      subcategory: result.subcategory ? this.cleanText(result.subcategory) : null,
     };
   }
 
@@ -115,6 +117,8 @@ export class UniversalExtractor {
       imageUrl: this.extractImageUrl(productData.image),
       availability: extractedOffers?.availability ?? true,
       description: String(productData.description || ''),
+      category: productData.category ? String(productData.category) : null,
+      subcategory: null,
     };
   }
 
@@ -145,6 +149,8 @@ export class UniversalExtractor {
       imageUrl: getMeta('og:image') || getMeta('image'),
       availability: true,
       description: getMeta('og:description') || getMeta('description'),
+      category: getMeta('product:category') || getMeta('og:category'),
+      subcategory: null,
     };
   }
 
@@ -178,6 +184,8 @@ export class UniversalExtractor {
       imageUrl: product.find('[itemprop="image"]').first().attr('src') || null,
       availability: getProp('availability')?.includes('InStock') ?? true,
       description: getProp('description'),
+      category: getProp('category'),
+      subcategory: null,
     };
   }
 
@@ -213,6 +221,8 @@ export class UniversalExtractor {
       imageUrl,
       availability: true,
       description: null,
+      category: null,
+      subcategory: null,
     };
   }
 

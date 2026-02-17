@@ -9,8 +9,8 @@ dist
 # blocked folders
 admin-dashboard
 android
-react-extension
-docs
+#react-extension
+#docs
 
 # code coverage
 coverage

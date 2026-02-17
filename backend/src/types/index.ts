@@ -5,6 +5,9 @@ export interface CanonicalProduct {
   gtin: string | null;
   ean: string | null;
   image_url: string | null;
+  category: string | null;
+  subcategory: string | null;
+  attributes: Record<string, unknown>;
   created_at: Date;
   updated_at: Date;
 }
@@ -16,6 +19,9 @@ export interface StoreProduct {
   store_sku: string | null;
   product_url: string;
   metadata: Record<string, unknown>;
+  condition: string;
+  condition_description: string | null;
+  seller_info: Record<string, unknown> | null;
   created_at: Date;
   updated_at: Date;
 }

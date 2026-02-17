@@ -9,6 +9,8 @@ export interface ExtractedProduct {
   currency: string | null;
   availability: boolean | null;
   description: string | null;
+  category: string | null;
+  subcategory: string | null;
 }
 
 export interface ProductExtractor {

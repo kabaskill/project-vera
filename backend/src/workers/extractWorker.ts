@@ -303,6 +303,8 @@ async function findOrCreateCanonicalProduct(
     gtin: extracted.gtin,
     ean: extracted.ean,
     image_url: extracted.imageUrl,
+    category: extracted.category,
+    subcategory: extracted.subcategory,
   });
 }
 
@@ -324,6 +326,93 @@ function detectStoreFromUrl(url: string): string {
 
 function isValidProduct(product: ExtractedProduct): boolean {
   return !!(product.name && product.name.length >= 3);
+}
+
+/**
+ * Process extension product submission synchronously (for instant API response)
+ */
+export async function processExtensionProduct({
+  url,
+  extractedData,
+  userId,
+}: {
+  url: string;
+  extractedData: ExtractedProduct;
+  userId?: string;
+}): Promise<{ productId: string; storeProductId: string }> {
+  console.log(`[ExtractWorker] Processing extension product: ${url}`);
+
+  // Validate the data
+  if (!isValidProduct(extractedData)) {
+    throw new Error("Invalid product data from extension");
+  }
+
+  const store = detectStoreFromUrl(url);
+
+  // Clean and validate GTIN/EAN
+  if (extractedData.gtin) {
+    extractedData.gtin = cleanGtin(extractedData.gtin);
+  }
+  if (extractedData.ean) {
+    extractedData.ean = cleanGtin(extractedData.ean);
+  }
+
+  // Find or create canonical product
+  const canonicalProduct = await findOrCreateCanonicalProduct(extractedData, url, store);
+
+  // Check if store product already exists for this URL
+  const existingStoreProduct = await productQueries.getStoreProductByUrl(url);
+
+  let storeProductId: string;
+
+  if (existingStoreProduct) {
+    storeProductId = existingStoreProduct.id;
+    console.log(`[ExtractWorker] Using existing store product: ${storeProductId}`);
+  } else {
+    // Create new store product
+    const newStoreProduct = await productQueries.createStoreProduct({
+      product_id: canonicalProduct.id,
+      store,
+      store_sku: extractedData.sku,
+      product_url: url,
+      metadata: {
+        extraction_method: "extension",
+        source: "extension",
+        extracted_at: new Date().toISOString(),
+      },
+    });
+    storeProductId = newStoreProduct.id;
+  }
+
+  // Create price entry
+  if (extractedData.price !== null && extractedData.price > 0) {
+    await productQueries.createPrice({
+      store_product_id: storeProductId,
+      price: extractedData.price,
+      currency: extractedData.currency || getDefaultCurrency(store),
+      availability: extractedData.availability ?? true,
+    });
+  }
+
+  // Cache URL in database for lookups
+  await productQueries.cacheUrl(url, canonicalProduct.id);
+
+  // Add to user history if userId provided
+  if (userId) {
+    try {
+      const { addProductToUserHistory } = await import("../db/queries/users.ts");
+      await addProductToUserHistory(userId, canonicalProduct.id);
+    } catch (error) {
+      console.warn(`[ExtractWorker] Failed to add to user history:`, error);
+    }
+  }
+
+  console.log(`[ExtractWorker] Completed extension product: ${canonicalProduct.id}`);
+
+  return {
+    productId: canonicalProduct.id,
+    storeProductId: storeProductId,
+  };
 }
 
 function getDefaultCurrency(store: string): string {

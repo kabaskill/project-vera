@@ -19,6 +19,8 @@ export class OpenGraphExtractor implements ProductExtractor {
 
       if (!title) return null;
 
+      const category = metaTags["product:category"] || metaTags["og:category"];
+
       return {
         name: title.trim(),
         brand: brand?.trim() || null,
@@ -30,6 +32,8 @@ export class OpenGraphExtractor implements ProductExtractor {
         currency: currency?.trim() || null,
         availability: availability ? availability.includes("instock") : null,
         description: description?.trim() || null,
+        category: category?.trim() || null,
+        subcategory: null,
       };
     } catch {
       return null;

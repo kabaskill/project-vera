@@ -30,7 +30,8 @@ export async function findProductByNameAndBrand(
 ): Promise<CanonicalProduct | null> {
   const normalizedName = name.toLowerCase().trim();
   
-  const result = brand 
+  // First try exact match
+  const exactResult = brand 
     ? await sql`
         SELECT * FROM canonical_products 
         WHERE LOWER(TRIM(canonical_name)) = ${normalizedName}
@@ -43,15 +44,40 @@ export async function findProductByNameAndBrand(
         LIMIT 1
       `;
   
-  return result[0] as CanonicalProduct | null;
+  if (exactResult[0]) {
+    return exactResult[0] as CanonicalProduct;
+  }
+  
+  // Try fuzzy match with same brand and name similarity
+  if (brand) {
+    const brandLower = brand.toLowerCase().trim();
+    
+    // Find products with same brand where names are similar
+    const fuzzyResult = await sql`
+      SELECT * FROM canonical_products 
+      WHERE LOWER(TRIM(brand)) = ${brandLower}
+      AND (
+        LOWER(TRIM(canonical_name)) ILIKE ${'%' + normalizedName + '%'}
+        OR ${normalizedName} ILIKE '%' || LOWER(TRIM(canonical_name)) || '%'
+      )
+      LIMIT 1
+    `;
+    
+    if (fuzzyResult[0]) {
+      console.log(`[Products] Fuzzy matched product: ${fuzzyResult[0].canonical_name}`);
+      return fuzzyResult[0] as CanonicalProduct;
+    }
+  }
+  
+  return null;
 }
 
 export async function createCanonicalProduct(
-  data: Pick<CanonicalProduct, "canonical_name" | "brand" | "gtin" | "ean" | "image_url">
+  data: Pick<CanonicalProduct, "canonical_name" | "brand" | "gtin" | "ean" | "image_url" | "category" | "subcategory">
 ): Promise<CanonicalProduct> {
   const result = await sql`
-    INSERT INTO canonical_products (canonical_name, brand, gtin, ean, image_url)
-    VALUES (${data.canonical_name}, ${data.brand}, ${data.gtin}, ${data.ean}, ${data.image_url})
+    INSERT INTO canonical_products (canonical_name, brand, gtin, ean, image_url, category, subcategory)
+    VALUES (${data.canonical_name}, ${data.brand}, ${data.gtin}, ${data.ean}, ${data.image_url}, ${data.category || null}, ${data.subcategory || null})
     RETURNING *
   `;
   return result[0] as CanonicalProduct;
@@ -174,21 +200,235 @@ export async function getCachedUrls(urls: string[]): Promise<Array<{ url: string
 
 export async function getSimilarProducts(
   productId: string,
-  _category?: string,
   limit: number = 5
-): Promise<CanonicalProduct[]> {
-  const source = await sql`SELECT * FROM canonical_products WHERE id = ${productId}`;
+): Promise<Array<CanonicalProduct & { 
+  similarity_score: number; 
+  match_reason: string;
+  price: number | null;
+  currency: string | null;
+  store: string | null;
+  product_url: string | null;
+}>> {
+  // Use the pre-computed similarity scores from product_similarity table
+  // Include price information from the cheapest store product
+  const result = await sql`
+    SELECT 
+      cp.*,
+      ps.similarity_score,
+      ps.match_reason,
+      min_price.price,
+      min_price.currency,
+      min_price.store,
+      min_price.product_url
+    FROM product_similarity ps
+    JOIN canonical_products cp ON ps.similar_product_id = cp.id
+    LEFT JOIN LATERAL (
+      SELECT 
+        p.price,
+        p.currency,
+        sp.store,
+        sp.product_url
+      FROM store_products sp
+      JOIN LATERAL (
+        SELECT price, currency
+        FROM prices
+        WHERE store_product_id = sp.id
+        ORDER BY timestamp DESC
+        LIMIT 1
+      ) p ON true
+      WHERE sp.product_id = ps.similar_product_id
+      ORDER BY p.price ASC
+      LIMIT 1
+    ) min_price ON true
+    WHERE ps.source_product_id = ${productId}
+    ORDER BY ps.similarity_score DESC
+    LIMIT ${limit}
+  `;
   
-  if (!source[0]) return [];
+  return result as Array<CanonicalProduct & { 
+    similarity_score: number; 
+    match_reason: string;
+    price: number | null;
+    currency: string | null;
+    store: string | null;
+    product_url: string | null;
+  }>;
+}
+
+export async function getProductVariants(
+  productId: string
+): Promise<Array<StoreProduct & { current_price: number; currency: string; condition: string }>> {
+  // Get all store products for this canonical product with their latest prices
+  const result = await sql`
+    SELECT 
+      sp.*,
+      p.price as current_price,
+      p.currency,
+      sp.condition
+    FROM store_products sp
+    LEFT JOIN LATERAL (
+      SELECT price, currency
+      FROM prices
+      WHERE store_product_id = sp.id
+      ORDER BY timestamp DESC
+      LIMIT 1
+    ) p ON true
+    WHERE sp.product_id = ${productId}
+    ORDER BY p.price ASC
+  `;
+  
+  return result as Array<StoreProduct & { current_price: number; currency: string; condition: string }>;
+}
+
+export async function getPriceComparison(
+  productId: string
+): Promise<Array<{
+  store: string;
+  store_sku: string;
+  product_url: string;
+  condition: string;
+  current_price: number;
+  currency: string;
+  lowest_price: number;
+  highest_price: number;
+  price_difference: number;
+  price_difference_percent: number;
+}>> {
+  // Get all store products with their prices and price statistics
+  const result = await sql`
+    WITH price_stats AS (
+      SELECT 
+        MIN(p.price) as lowest_price,
+        MAX(p.price) as highest_price,
+        AVG(p.price) as avg_price
+      FROM store_products sp
+      JOIN prices p ON p.store_product_id = sp.id
+      WHERE sp.product_id = ${productId}
+        AND p.timestamp = (
+          SELECT MAX(timestamp) 
+          FROM prices 
+          WHERE store_product_id = sp.id
+        )
+    )
+    SELECT 
+      sp.store,
+      sp.store_sku,
+      sp.product_url,
+      sp.condition,
+      p.price as current_price,
+      p.currency,
+      ps.lowest_price,
+      ps.highest_price,
+      (p.price - ps.lowest_price) as price_difference,
+      ROUND(((p.price - ps.lowest_price) / ps.lowest_price * 100), 2) as price_difference_percent
+    FROM store_products sp
+    JOIN LATERAL (
+      SELECT price, currency
+      FROM prices
+      WHERE store_product_id = sp.id
+      ORDER BY timestamp DESC
+      LIMIT 1
+    ) p ON true
+    CROSS JOIN price_stats ps
+    WHERE sp.product_id = ${productId}
+    ORDER BY p.price ASC
+  `;
+  
+  return result;
+}
+
+export async function getProductsByCategory(
+  category: string,
+  subcategory?: string,
+  limit: number = 20
+): Promise<Array<CanonicalProduct & {
+  price: number | null;
+  currency: string | null;
+  store: string | null;
+  product_url: string | null;
+}>> {
+  // Get products from category with their lowest price
+  const result = subcategory
+    ? await sql`
+        SELECT 
+          cp.*,
+          min_price.price,
+          min_price.currency,
+          min_price.store,
+          min_price.product_url
+        FROM canonical_products cp
+        LEFT JOIN LATERAL (
+          SELECT 
+            p.price,
+            p.currency,
+            sp.store,
+            sp.product_url
+          FROM store_products sp
+          JOIN LATERAL (
+            SELECT price, currency
+            FROM prices
+            WHERE store_product_id = sp.id
+            ORDER BY timestamp DESC
+            LIMIT 1
+          ) p ON true
+          WHERE sp.product_id = cp.id
+          ORDER BY p.price ASC
+          LIMIT 1
+        ) min_price ON true
+        WHERE cp.category = ${category}
+        AND cp.subcategory = ${subcategory}
+        LIMIT ${limit}
+      `
+    : await sql`
+        SELECT 
+          cp.*,
+          min_price.price,
+          min_price.currency,
+          min_price.store,
+          min_price.product_url
+        FROM canonical_products cp
+        LEFT JOIN LATERAL (
+          SELECT 
+            p.price,
+            p.currency,
+            sp.store,
+            sp.product_url
+          FROM store_products sp
+          JOIN LATERAL (
+            SELECT price, currency
+            FROM prices
+            WHERE store_product_id = sp.id
+            ORDER BY timestamp DESC
+            LIMIT 1
+          ) p ON true
+          WHERE sp.product_id = cp.id
+          ORDER BY p.price ASC
+          LIMIT 1
+        ) min_price ON true
+        WHERE cp.category = ${category}
+        LIMIT ${limit}
+      `;
+  
+  return result as Array<CanonicalProduct & {
+    price: number | null;
+    currency: string | null;
+    store: string | null;
+    product_url: string | null;
+  }>;
+}
+
+export async function getProductsByAttributes(
+  attributes: Record<string, string>,
+  limit: number = 20
+): Promise<CanonicalProduct[]> {
+  // Build dynamic query based on attributes
+  const conditions = Object.entries(attributes).map(([key, value]) => 
+    `attributes->>'${key}' = '${value}'`
+  ).join(' AND ');
   
   const result = await sql`
-    SELECT DISTINCT cp.*
-    FROM canonical_products cp
-    WHERE cp.id != ${productId}
-    AND (
-      cp.brand = ${source[0].brand}
-      OR cp.canonical_name ILIKE ${'%' + source[0].canonical_name.split(' ')[0] + '%'}
-    )
+    SELECT * FROM canonical_products
+    WHERE ${sql.unsafe(conditions)}
     LIMIT ${limit}
   `;
   

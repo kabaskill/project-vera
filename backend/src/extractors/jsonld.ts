@@ -73,6 +73,8 @@ export class JsonLdExtractor implements ProductExtractor {
       currency: offers?.currency || null,
       availability: offers?.availability || null,
       description: this.cleanText(data.description as string) || null,
+      category: this.cleanText(data.category as string) || null,
+      subcategory: null,
     };
   }
 
