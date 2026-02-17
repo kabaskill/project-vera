@@ -200,6 +200,51 @@ export async function productRoutes(app: FastifyInstance) {
     };
   });
 
+  // Get products by URLs (for extension sync)
+  // Uses url_cache for O(1) lookups - much faster than joining tables
+  app.post("/by-urls", async (request) => {
+    const body = z.object({
+      urls: z.array(z.string().url()).max(50),
+    }).parse(request.body);
+    
+    if (body.urls.length === 0) {
+      return { products: [] };
+    }
+    
+    // Use url_cache for fast lookups
+    // This is O(1) per URL vs O(n) join query
+    const cachedUrls = await productQueries.getCachedUrls(body.urls);
+    
+    // Get product details for found URLs
+    const productIds = cachedUrls.map(c => c.productId);
+    let products: Array<{ id: string; canonical_name: string; brand: string | null; image_url: string | null }> = [];
+    
+    if (productIds.length > 0) {
+      const result = await sql`
+        SELECT id, canonical_name, brand, image_url
+        FROM canonical_products
+        WHERE id = ANY(${productIds})
+      `;
+      products = result as typeof products;
+    }
+    
+    // Create a map for quick lookup
+    const productMap = new Map(products.map(p => [p.id, p]));
+    
+    return {
+      products: cachedUrls.map(({ url, productId }) => {
+        const product = productMap.get(productId);
+        return {
+          url,
+          productId,
+          name: product?.canonical_name || '',
+          brand: product?.brand || null,
+          imageUrl: product?.image_url || null,
+        };
+      }),
+    };
+  });
+
   // Submit HTML for processing (admin/testing only)
   app.post("/submit-html", async (request, reply) => {
     const body = submitHtmlSchema.parse(request.body);

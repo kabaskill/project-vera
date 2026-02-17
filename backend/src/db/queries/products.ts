@@ -156,6 +156,22 @@ export async function getCachedUrl(url: string): Promise<string | null> {
   return result[0]?.product_id as string | null;
 }
 
+export async function getCachedUrls(urls: string[]): Promise<Array<{ url: string; productId: string }>> {
+  if (urls.length === 0) return [];
+  
+  const result = await sql`
+    SELECT url, product_id 
+    FROM url_cache 
+    WHERE url = ANY(${urls}) 
+    AND expires_at > NOW()
+  `;
+  
+  return result.map(row => ({
+    url: row.url as string,
+    productId: row.product_id as string,
+  }));
+}
+
 export async function getSimilarProducts(
   productId: string,
   _category?: string,

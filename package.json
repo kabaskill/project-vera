@@ -1,6 +1,10 @@
 {
   "name": "vera-monorepo",
   "version": "1.0.0",
+  "devDependencies": {
+    "@types/chrome": "^0.1.36",
+    "concurrently": "^8.2.2"
+  },
   "private": true,
   "scripts": {
     "infra:up": "docker compose up -d",
@@ -15,8 +19,5 @@
     "dev:admin": "cd admin-dashboard && bun run dev",
     "setup": "bun install && cd backend && bun install && cd ../admin-dashboard && bun install",
     "setup:local": "bun run setup && bun run infra:up && bun run db:start && bun run db:migrate"
-  },
-  "devDependencies": {
-    "concurrently": "^8.2.2"
   }
 }
