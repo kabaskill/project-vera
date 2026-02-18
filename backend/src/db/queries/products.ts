@@ -73,11 +73,11 @@ export async function findProductByNameAndBrand(
 }
 
 export async function createCanonicalProduct(
-  data: Pick<CanonicalProduct, "canonical_name" | "brand" | "gtin" | "ean" | "image_url" | "category" | "subcategory">
+  data: Pick<CanonicalProduct, "canonical_name" | "brand" | "gtin" | "ean" | "image_url" | "category" | "subcategory" | "attributes">
 ): Promise<CanonicalProduct> {
   const result = await sql`
-    INSERT INTO canonical_products (canonical_name, brand, gtin, ean, image_url, category, subcategory)
-    VALUES (${data.canonical_name}, ${data.brand}, ${data.gtin}, ${data.ean}, ${data.image_url}, ${data.category || null}, ${data.subcategory || null})
+    INSERT INTO canonical_products (canonical_name, brand, gtin, ean, image_url, category, subcategory, attributes)
+    VALUES (${data.canonical_name}, ${data.brand}, ${data.gtin}, ${data.ean}, ${data.image_url}, ${data.category || null}, ${data.subcategory || null}, ${data.attributes ? JSON.stringify(data.attributes) : null})
     RETURNING *
   `;
   return result[0] as CanonicalProduct;

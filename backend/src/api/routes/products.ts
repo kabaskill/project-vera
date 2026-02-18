@@ -200,6 +200,60 @@ export async function productRoutes(app: FastifyInstance) {
     };
   });
 
+  // Get featured products (random selection with prices)
+  app.get("/featured", async () => {
+    const result = await sql`
+      SELECT 
+        cp.id,
+        cp.canonical_name,
+        cp.brand,
+        cp.category,
+        cp.subcategory,
+        cp.image_url,
+        min_price.price,
+        min_price.currency,
+        min_price.store,
+        min_price.product_url
+      FROM canonical_products cp
+      LEFT JOIN LATERAL (
+        SELECT 
+          p.price,
+          p.currency,
+          sp.store,
+          sp.product_url
+        FROM store_products sp
+        JOIN LATERAL (
+          SELECT price, currency
+          FROM prices
+          WHERE store_product_id = sp.id
+          ORDER BY timestamp DESC
+          LIMIT 1
+        ) p ON true
+        WHERE sp.product_id = cp.id
+        ORDER BY p.price ASC
+        LIMIT 1
+      ) min_price ON true
+      WHERE min_price.price IS NOT NULL
+      ORDER BY RANDOM()
+      LIMIT 10
+    `;
+    
+    return {
+      products: result.map(p => ({
+        id: p.id,
+        name: p.canonical_name,
+        brand: p.brand,
+        category: p.category,
+        subcategory: p.subcategory,
+        image_url: p.image_url,
+        price: p.price,
+        currency: p.currency,
+        store: p.store,
+        product_url: p.product_url,
+      })),
+    };
+  });
+
   // Get products by URLs (for extension sync)
   // Uses url_cache for O(1) lookups - much faster than joining tables
   app.post("/by-urls", async (request) => {
@@ -305,6 +359,7 @@ export async function productRoutes(app: FastifyInstance) {
           description: z.string().nullish(),
           category: z.string().nullish(),
           subcategory: z.string().nullish(),
+          attributes: z.record(z.string()).optional(),
         }),
         userId: z.string().optional(),
       }).parse(request.body);
@@ -325,6 +380,7 @@ export async function productRoutes(app: FastifyInstance) {
         description: body.extractedData.description || null,
         category: body.extractedData.category || null,
         subcategory: body.extractedData.subcategory || null,
+        attributes: body.extractedData.attributes as Record<string, string> | undefined,
       };
       
       const result = await processExtensionProduct({

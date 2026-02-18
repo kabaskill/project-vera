@@ -4,6 +4,7 @@ import * as productQueries from "../db/queries/products.ts";
 import { getRedisClient } from "../services/redis.ts";
 import type { ExtractedProduct } from "../extractors/types.ts";
 import { cleanGtin } from "../utils/gtinValidator.ts";
+import { normalizeCategory, inferAttributes } from "../services/categoryNormalizer.ts";
 
 interface ExtractProductPayload {
   url: string;
@@ -256,7 +257,7 @@ async function findOrCreateCanonicalProduct(
   extracted: ExtractedProduct,
   url: string,
   storeName?: string
-): Promise<{ id: string; canonical_name: string; brand: string | null; gtin: string | null; ean: string | null; image_url: string | null; created_at: Date; updated_at: Date }> {
+): Promise<{ id: string; canonical_name: string; brand: string | null; gtin: string | null; ean: string | null; image_url: string | null; category: string | null; subcategory: string | null; attributes: Record<string, unknown> | null; created_at: Date; updated_at: Date }> {
   // Try to find by GTIN (most reliable)
   if (extracted.gtin) {
     const byGtin = await productQueries.findProductByGtin(extracted.gtin);
@@ -295,17 +296,45 @@ async function findOrCreateCanonicalProduct(
     }
   }
 
+  // Normalize category and infer attributes
+  const { category, subcategory } = normalizeCategory(
+    extracted.category,
+    extracted.brand,
+    extracted.name
+  );
+  
+  const inferredAttributes = inferAttributes(
+    extracted.name,
+    extracted.brand,
+    extracted.description
+  );
+  
+  // Merge with any existing attributes
+  const attributes = {
+    ...inferredAttributes,
+    ...(extracted.attributes || {}),
+  };
+  
   // Create new canonical product
   console.log(`[ExtractWorker] Creating new canonical product: ${extracted.name}`);
-  return await productQueries.createCanonicalProduct({
+  console.log(`[ExtractWorker] Normalized category: ${category}/${subcategory}`);
+  console.log(`[ExtractWorker] Inferred attributes:`, attributes);
+  
+  const newProduct = await productQueries.createCanonicalProduct({
     canonical_name: extracted.name,
     brand: extracted.brand,
     gtin: extracted.gtin,
     ean: extracted.ean,
     image_url: extracted.imageUrl,
-    category: extracted.category,
-    subcategory: extracted.subcategory,
+    category,
+    subcategory,
+    attributes,
   });
+  
+  // Compute similarity scores for the new product
+  await computeAndStoreSimilarity(newProduct);
+  
+  return newProduct;
 }
 
 function detectStoreFromUrl(url: string): string {
@@ -434,4 +463,81 @@ async function hashUrl(url: string): Promise<string> {
   const hashBuffer = await crypto.subtle.digest("SHA-256", data);
   const hashArray = Array.from(new Uint8Array(hashBuffer));
   return hashArray.map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
+}
+
+async function computeAndStoreSimilarity(
+  newProduct: { id: string; canonical_name: string; brand: string | null; category: string | null; subcategory: string | null; attributes: Record<string, unknown> | null }
+): Promise<void> {
+  try {
+    const { sql } = await import("../db/connection.ts");
+    
+    const existingProducts = await sql`
+      SELECT id, canonical_name, brand, category, subcategory, attributes 
+      FROM canonical_products 
+      WHERE id != ${newProduct.id}
+    `;
+    
+    let similarityMatches = 0;
+    
+    for (const existing of existingProducts) {
+      let score = 0;
+      const reasons: string[] = [];
+      
+      if (newProduct.category && existing.category === newProduct.category) {
+        score += 0.3;
+        reasons.push('same_category');
+        
+        if (newProduct.subcategory && existing.subcategory === newProduct.subcategory) {
+          score += 0.2;
+          reasons.push('same_subcategory');
+        }
+      }
+      
+      if (newProduct.brand && existing.brand === newProduct.brand) {
+        score += 0.2;
+        reasons.push('same_brand');
+      }
+      
+      const newAttrs = (newProduct.attributes as Record<string, string>) || {};
+      const existingAttrs = (existing.attributes as Record<string, string>) || {};
+      
+      let attrMatches = 0;
+      let totalAttrs = 0;
+      
+      for (const [key, value] of Object.entries(newAttrs)) {
+        totalAttrs++;
+        if (existingAttrs[key] === value) attrMatches++;
+      }
+      
+      if (totalAttrs > 0) {
+        const attrScore = (attrMatches / totalAttrs) * 0.3;
+        score += attrScore;
+        if (attrScore > 0.1) reasons.push('similar_attributes');
+      }
+      
+      if (score > 0.4) {
+        const finalScore = Math.round(score * 100) / 100;
+        
+        try {
+          await sql`
+            INSERT INTO product_similarity (source_product_id, similar_product_id, similarity_score, match_reason)
+            VALUES (${newProduct.id}, ${existing.id}, ${finalScore}, ${reasons.join(',')})
+            ON CONFLICT (source_product_id, similar_product_id) DO NOTHING
+          `;
+          
+          await sql`
+            INSERT INTO product_similarity (source_product_id, similar_product_id, similarity_score, match_reason)
+            VALUES (${existing.id}, ${newProduct.id}, ${finalScore}, ${reasons.join(',')})
+            ON CONFLICT (source_product_id, similar_product_id) DO NOTHING
+          `;
+          
+          similarityMatches++;
+        } catch {}
+      }
+    }
+    
+    console.log(`[ExtractWorker] Created ${similarityMatches} similarity matches for new product`);
+  } catch (error) {
+    console.warn('[ExtractWorker] Failed to compute similarity:', error);
+  }
 }

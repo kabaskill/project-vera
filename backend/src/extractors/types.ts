@@ -11,6 +11,7 @@ export interface ExtractedProduct {
   description: string | null;
   category: string | null;
   subcategory: string | null;
+  attributes?: Record<string, string>;
 }
 
 export interface ProductExtractor {
